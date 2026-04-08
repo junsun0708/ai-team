@@ -32,7 +32,19 @@ mkdir -p "$PROJECT_DIR/logs"
 tmux new-session -d -s "$SESSION" -n "bot" -x 220 -y 50
 
 # Slack Bot 시작
-tmux send-keys -t "$SESSION:bot" "cd $PROJECT_DIR/slack_bot && python app.py" Enter
+# leader 윈도우 생성: Claude 팀리더
+tmux new-window -t "$SESSION" -n "leader"
+tmux send-keys -t "$SESSION:leader" \
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 claude --dangerously-skip-permissions --teammate-mode tmux" Enter
+
+# Claude 시작 대기
+sleep 5
+
+# pipe-pane으로 리더 출력 로깅
+tmux pipe-pane -t "$SESSION:leader" -o "cat >> $PROJECT_DIR/logs/leader_output.log"
+
+# Slack Bot 시작 (bot 윈도우)
+tmux send-keys -t "$SESSION:bot" "cd $PROJECT_DIR/slack_bot && python3 app.py" Enter
 
 echo "✅ AI Team 시작됨"
 echo ""

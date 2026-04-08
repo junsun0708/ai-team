@@ -154,12 +154,9 @@ def main():
     log_dir = os.path.join(os.path.dirname(__file__), '..', 'logs')
     os.makedirs(log_dir, exist_ok=True)
 
-    # Claude 팀리더 세션 시작
-    logger.info("Claude 팀리더 세션 시작 중...")
-    start_leader_session()
-
+    # leader 세션은 start.sh가 먼저 띄움 — 여기선 확인만
     if not is_session_alive():
-        logger.error("Claude 팀리더 세션 시작 실패!")
+        logger.error("ai-team tmux 세션이 없습니다. start.sh로 시작해주세요.")
         sys.exit(1)
 
     logger.info("AI Team Slack Bot 시작")

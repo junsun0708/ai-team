@@ -42,6 +42,15 @@ def is_session_alive() -> bool:
     return result.returncode == 0
 
 
+def is_leader_ready() -> bool:
+    """leader 윈도우가 존재하는지 확인"""
+    result = _run(
+        f"tmux list-windows -t {TMUX_SESSION} -F '#{{window_name}}'",
+        check=False
+    )
+    return LEADER_WINDOW in result.stdout
+
+
 def start_leader_session():
     """Claude 팀리더를 tmux 세션에서 시작"""
     if is_session_alive():
@@ -155,15 +164,26 @@ def send_message(message: str) -> str:
     4. 응답 텍스트 추출 후 반환
     """
     if not is_session_alive():
-        start_leader_session()
+        raise RuntimeError("ai-team tmux 세션이 없습니다. ./scripts/start.sh로 시작해주세요.")
+
+    if not is_leader_ready():
+        raise RuntimeError("leader 윈도우가 없습니다. ./scripts/start.sh로 재시작해주세요.")
 
     # 현재 로그 위치 기록
     log_offset = _get_log_size()
 
-    # 메시지 전송 (특수문자 이스케이프)
-    # tmux send-keys는 문자열을 그대로 전송
-    escaped = message.replace("'", "'\\''")
-    _run(f"tmux send-keys -t {LEADER_TARGET} -- '{escaped}' Enter")
+    # 메시지 전송: tmux send-keys -l (literal)로 특수문자 안전 전송
+    # 임시파일에 쓴 뒤 tmux load-buffer + paste-buffer 사용
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(message)
+        tmp_path = f.name
+    try:
+        _run(f"tmux load-buffer -b ai-team-input '{tmp_path}'")
+        _run(f"tmux paste-buffer -b ai-team-input -t {LEADER_TARGET}")
+        _run(f"tmux send-keys -t {LEADER_TARGET} Enter")
+    finally:
+        os.unlink(tmp_path)
 
     logger.info(f"메시지 전송됨: {message[:100]}...")
 
