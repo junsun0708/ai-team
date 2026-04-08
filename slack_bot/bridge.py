@@ -1,17 +1,20 @@
 """
-Claude Team Leader <-> tmux 브릿지
+Claude Team Leader <-> tmux 브릿지 (실시간 스트리밍)
 
-tmux 세션 안에서 실행 중인 Claude 팀리더와 통신합니다.
-- 입력: tmux send-keys로 메시지 전달
-- 출력: pipe-pane 로그 파일 모니터링 + idle 감지
+tmux 세션 안에서 실행 중인 Claude 팀리더와 양방향 통신합니다.
+- 입력: tmux load-buffer + paste-buffer로 메시지 전달
+- 출력: pipe-pane 로그 파일을 실시간 모니터링, idle 감지 시 콜백 호출
 """
 
 import os
 import re
 import subprocess
+import tempfile
 import time
 import logging
+import threading
 from pathlib import Path
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +25,10 @@ LOG_DIR = Path(__file__).parent.parent / "logs"
 LEADER_LOG = LOG_DIR / "leader_output.log"
 WORK_DIR = os.environ.get("WORK_DIR", os.path.expanduser("~/a-projects"))
 
-# idle 감지: 마지막 출력 후 이 시간(초)이 지나면 응답 완료로 판단
-IDLE_TIMEOUT = 10
-# 최대 대기 시간 (분)
-MAX_WAIT_MINUTES = 30
+# 출력이 멈춘 후 이 시간(초)이 지나면 버퍼를 슬랙으로 전송
+FLUSH_TIMEOUT = 5
 # 폴링 간격 (초)
-POLL_INTERVAL = 2
+POLL_INTERVAL = 1
 
 
 def _run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -51,60 +52,18 @@ def is_leader_ready() -> bool:
     return LEADER_WINDOW in result.stdout
 
 
-def start_leader_session():
-    """Claude 팀리더를 tmux 세션에서 시작"""
-    if is_session_alive():
-        logger.info("ai-team 세션이 이미 실행 중입니다.")
-        return True
-
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-    # 로그 파일 초기화
-    LEADER_LOG.write_text("")
-
-    # tmux 세션 생성 (leader 윈도우)
-    _run(
-        f"tmux new-session -d -s {TMUX_SESSION} -n {LEADER_WINDOW} "
-        f"-x 220 -y 50"
-    )
-
-    # 환경변수 설정 후 Claude 시작
-    claude_cmd = (
-        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 "
-        f"claude --dangerously-skip-permissions --teammate-mode tmux"
-    )
-    _run(f"tmux send-keys -t {LEADER_TARGET} '{claude_cmd}' Enter")
-
-    # pipe-pane으로 출력 로깅
-    _run(
-        f"tmux pipe-pane -t {LEADER_TARGET} -o "
-        f"'cat >> {LEADER_LOG}'"
-    )
-
-    # Claude 시작 대기
-    time.sleep(5)
-
-    logger.info("Claude 팀리더 세션 시작됨")
-    return True
-
-
 def stop_leader_session():
     """팀리더 세션 종료"""
     if not is_session_alive():
         logger.info("실행 중인 세션이 없습니다.")
         return
-
-    # Claude에게 정리 요청
     _run(f"tmux send-keys -t {LEADER_TARGET} '/exit' Enter", check=False)
     time.sleep(3)
-
-    # tmux 세션 종료
     _run(f"tmux kill-session -t {TMUX_SESSION}", check=False)
     logger.info("ai-team 세션 종료됨")
 
 
 def _get_log_size() -> int:
-    """로그 파일 현재 크기"""
     try:
         return LEADER_LOG.stat().st_size
     except FileNotFoundError:
@@ -112,7 +71,6 @@ def _get_log_size() -> int:
 
 
 def _read_log_from(offset: int) -> str:
-    """로그 파일에서 offset 이후 내용 읽기"""
     try:
         with open(LEADER_LOG, "r", errors="replace") as f:
             f.seek(offset)
@@ -122,59 +80,41 @@ def _read_log_from(offset: int) -> str:
 
 
 def _clean_ansi(text: str) -> str:
-    """ANSI escape 시퀀스 제거"""
+    """ANSI escape 시퀀스 및 제어 문자 제거"""
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     text = ansi_escape.sub('', text)
-    # 추가 제어 문자 제거
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
     return text
 
 
-def _extract_response(raw: str) -> str:
-    """원시 출력에서 Claude 응답 텍스트 추출"""
+def _clean_output(raw: str) -> str:
+    """원시 출력을 정리하여 슬랙에 보낼 텍스트 추출"""
     cleaned = _clean_ansi(raw)
-
-    # 빈 줄, 프롬프트 기호 등 정리
     lines = cleaned.split('\n')
     result_lines = []
     for line in lines:
         stripped = line.strip()
-        # 빈 줄이나 프롬프트만 있는 줄 스킵
         if not stripped or stripped in ('>', '❯', '$', '%'):
             continue
-        # 입력된 명령어 줄 스킵 (보낸 메시지와 동일한 줄)
         result_lines.append(line)
 
     result = '\n'.join(result_lines).strip()
 
-    # 너무 길면 앞뒤 요약
-    if len(result) > 3000:
-        result = result[:1500] + "\n\n... (중략) ...\n\n" + result[-1500:]
+    # 슬랙 메시지 길이 제한
+    if len(result) > 3800:
+        result = result[:1800] + "\n\n... (중략) ...\n\n" + result[-1800:]
 
     return result
 
 
-def send_message(message: str) -> str:
+def send_input(message: str):
     """
-    Claude 팀리더에게 메시지를 보내고 응답을 반환합니다.
-
-    1. 현재 로그 위치 기록
-    2. tmux send-keys로 메시지 전송
-    3. 로그 파일 모니터링하며 idle 감지
-    4. 응답 텍스트 추출 후 반환
+    Claude 팀리더에게 입력을 보냅니다 (비차단).
+    새 작업 지시, 질문에 대한 답변, 'y' 확인 등 모두 이 함수로 전송.
     """
-    if not is_session_alive():
-        raise RuntimeError("ai-team tmux 세션이 없습니다. ./scripts/start.sh로 시작해주세요.")
+    if not is_session_alive() or not is_leader_ready():
+        raise RuntimeError("ai-team 세션이 없습니다. ./scripts/start.sh로 시작해주세요.")
 
-    if not is_leader_ready():
-        raise RuntimeError("leader 윈도우가 없습니다. ./scripts/start.sh로 재시작해주세요.")
-
-    # 현재 로그 위치 기록
-    log_offset = _get_log_size()
-
-    # 메시지 전송: tmux send-keys -l (literal)로 특수문자 안전 전송
-    # 임시파일에 쓴 뒤 tmux load-buffer + paste-buffer 사용
-    import tempfile
     with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
         f.write(message)
         tmp_path = f.name
@@ -185,41 +125,76 @@ def send_message(message: str) -> str:
     finally:
         os.unlink(tmp_path)
 
-    logger.info(f"메시지 전송됨: {message[:100]}...")
+    logger.info(f"입력 전송됨: {message[:100]}...")
 
-    # 응답 대기 (idle 감지)
-    max_wait = MAX_WAIT_MINUTES * 60
-    elapsed = 0
-    last_size = log_offset
-    idle_start = None
 
-    while elapsed < max_wait:
-        time.sleep(POLL_INTERVAL)
-        elapsed += POLL_INTERVAL
+class OutputMonitor:
+    """
+    리더 pane 출력을 실시간 모니터링합니다.
 
-        current_size = _get_log_size()
+    출력이 감지되면 버퍼에 쌓아두고,
+    FLUSH_TIMEOUT 동안 새 출력이 없으면 (idle)
+    버퍼를 정리하여 on_output 콜백으로 전달합니다.
 
-        if current_size > last_size:
-            # 새 출력이 있으면 idle 타이머 리셋
-            last_size = current_size
-            idle_start = None
-        else:
-            # 출력이 멈춤
-            if idle_start is None:
-                idle_start = time.time()
-            elif time.time() - idle_start >= IDLE_TIMEOUT:
-                # idle 시간 초과 → 응답 완료
-                break
+    → 슬랙에 실시간으로 Claude 출력이 전달됩니다.
+    """
 
-    # 응답 추출
-    raw_output = _read_log_from(log_offset)
-    response = _extract_response(raw_output)
+    def __init__(self, on_output: Callable[[str], None]):
+        self.on_output = on_output
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._log_offset = 0
 
-    if not response:
-        response = "(응답을 캡처하지 못했습니다. `tmux attach -t ai-team`으로 직접 확인해주세요.)"
+    def start(self):
+        """모니터링 시작"""
+        if self._running:
+            return
+        self._log_offset = _get_log_size()
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        logger.info("OutputMonitor 시작됨")
 
-    logger.info(f"응답 수신됨 ({len(response)} chars)")
-    return response
+    def stop(self):
+        """모니터링 중지"""
+        self._running = False
+        logger.info("OutputMonitor 중지됨")
+
+    def reset_offset(self):
+        """새 메시지 전송 후 오프셋 리셋 (입력 에코 건너뛰기)"""
+        time.sleep(0.5)
+        self._log_offset = _get_log_size()
+
+    def _loop(self):
+        buffer = ""
+        idle_start = None
+
+        while self._running:
+            time.sleep(POLL_INTERVAL)
+
+            current_size = _get_log_size()
+
+            if current_size > self._log_offset:
+                # 새 출력 있음
+                new_content = _read_log_from(self._log_offset)
+                self._log_offset = current_size
+                buffer += new_content
+                idle_start = None
+
+            elif buffer:
+                # 출력 멈춤 + 버퍼에 데이터 있음
+                if idle_start is None:
+                    idle_start = time.time()
+                elif time.time() - idle_start >= FLUSH_TIMEOUT:
+                    # idle 시간 초과 → 버퍼 플러시
+                    cleaned = _clean_output(buffer)
+                    if cleaned:
+                        try:
+                            self.on_output(cleaned)
+                        except Exception as e:
+                            logger.error(f"on_output 콜백 오류: {e}")
+                    buffer = ""
+                    idle_start = None
 
 
 def get_team_status() -> str:
@@ -227,7 +202,6 @@ def get_team_status() -> str:
     if not is_session_alive():
         return "ai-team 세션이 실행되고 있지 않습니다."
 
-    # tmux 윈도우/페인 목록
     result = _run(
         f"tmux list-panes -s -t {TMUX_SESSION} "
         f"-F '#{{window_name}}:#{{pane_index}} #{{pane_current_command}} #{{pane_width}}x#{{pane_height}}'",
