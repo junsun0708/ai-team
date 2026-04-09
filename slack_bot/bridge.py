@@ -1,9 +1,9 @@
 """
-Claude Team Leader <-> tmux 브릿지 (실시간 스트리밍)
+Claude Team Leader <-> tmux 브릿지 (capture-pane 기반)
 
 tmux 세션 안에서 실행 중인 Claude 팀리더와 양방향 통신합니다.
 - 입력: tmux load-buffer + paste-buffer로 메시지 전달
-- 출력: pipe-pane 로그 파일을 실시간 모니터링, idle 감지 시 콜백 호출
+- 출력: tmux capture-pane으로 화면 캡처 → 이전 화면과 diff하여 Claude 응답만 추출
 """
 
 import os
@@ -22,13 +22,12 @@ TMUX_SESSION = "ai-team"
 LEADER_WINDOW = "leader"
 LEADER_TARGET = f"{TMUX_SESSION}:{LEADER_WINDOW}"
 LOG_DIR = Path(__file__).parent.parent / "logs"
-LEADER_LOG = LOG_DIR / "leader_output.log"
 WORK_DIR = os.environ.get("WORK_DIR", os.path.expanduser("~/a-projects"))
 
-# 출력이 멈춘 후 이 시간(초)이 지나면 버퍼를 슬랙으로 전송
+# 화면이 안정된 후 이 시간(초)이 지나면 응답으로 간주
 FLUSH_TIMEOUT = 5
 # 폴링 간격 (초)
-POLL_INTERVAL = 1
+POLL_INTERVAL = 2
 
 
 def _run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -63,55 +62,79 @@ def stop_leader_session():
     logger.info("ai-team 세션 종료됨")
 
 
-def _get_log_size() -> int:
-    try:
-        return LEADER_LOG.stat().st_size
-    except FileNotFoundError:
-        return 0
+def _capture_pane() -> str:
+    """tmux capture-pane으로 현재 화면 내용을 깨끗하게 가져온다."""
+    result = _run(f"tmux capture-pane -t {LEADER_TARGET} -p", check=False)
+    return result.stdout if result.returncode == 0 else ""
 
 
-def _read_log_from(offset: int) -> str:
-    try:
-        with open(LEADER_LOG, "r", errors="replace") as f:
-            f.seek(offset)
-            return f.read()
-    except FileNotFoundError:
-        return ""
+# Claude 응답 블록을 나타내는 마커들
+_RESPONSE_MARKERS = re.compile(r'^[●◇◆⎿✓✗⚠]')
+_NOISE_PATTERNS = re.compile('|'.join([
+    r'^❯\s',                          # 프롬프트
+    r'^[─━═]{3,}',                     # 구분선
+    r'bypass\s+permissions',           # 상태바
+    r'shift\+tab\s+to\s+cycle',
+    r'esc\s+to\s+interrupt',
+    r'Claude Code (v|has)',
+    r'^▐▛|^▝▜|^\s*▘▘',               # 로고
+    r'Opus \d|Claude Max',             # 모델 표시
+    r'~/a-projects',                   # 경로 표시
+    r'^\$\s',                          # 쉘 프롬프트
+    r'^\s*⧉\s+Selected',              # IDE 연동
+    r'^\[Slack 요청',                  # 입력 에코
+    r'(Marinating|Manifesting|Osmosing|Thinking|Warming)',  # 스피너
+    r'^[✢✶✻✽✲✱✴✵\*·]+\s*(Marinating|Manifesting|Osmosing|Thinking|Warming)',
+]), re.IGNORECASE)
 
 
-def _clean_ansi(text: str) -> str:
-    """ANSI escape 시퀀스 및 제어 문자 제거"""
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    text = ansi_escape.sub('', text)
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-    return text
+def _extract_responses(screen: str) -> list[str]:
+    """capture-pane 화면에서 Claude 응답 블록들만 추출한다."""
+    lines = screen.split('\n')
+    responses = []
+    current_block = []
+    in_response = False
 
-
-def _clean_output(raw: str) -> str:
-    """원시 출력을 정리하여 슬랙에 보낼 텍스트 추출"""
-    cleaned = _clean_ansi(raw)
-    lines = cleaned.split('\n')
-    result_lines = []
     for line in lines:
         stripped = line.strip()
-        if not stripped or stripped in ('>', '❯', '$', '%'):
+        if not stripped:
+            if in_response and current_block:
+                current_block.append('')
             continue
-        result_lines.append(line)
 
-    result = '\n'.join(result_lines).strip()
+        # 노이즈 라인 스킵
+        if _NOISE_PATTERNS.search(stripped):
+            if in_response and current_block:
+                # 응답 블록 끝
+                responses.append('\n'.join(current_block).strip())
+                current_block = []
+                in_response = False
+            continue
 
-    # 슬랙 메시지 길이 제한
-    if len(result) > 3800:
-        result = result[:1800] + "\n\n... (중략) ...\n\n" + result[-1800:]
+        # 응답 시작 마커 (● 로 시작하는 줄 = Claude 텍스트 응답)
+        if stripped.startswith('●'):
+            in_response = True
+            # ● 마커 제거
+            text = stripped[1:].strip()
+            if text:
+                current_block.append(text)
+            continue
 
-    return result
+        # ⎿ 로 시작하는 줄 (도구 사용 UI) → 무시
+        if stripped.startswith('⎿'):
+            continue
+
+        if in_response:
+            current_block.append(stripped)
+
+    if current_block:
+        responses.append('\n'.join(current_block).strip())
+
+    return [r for r in responses if r]
 
 
 def send_input(message: str):
-    """
-    Claude 팀리더에게 입력을 보냅니다 (비차단).
-    새 작업 지시, 질문에 대한 답변, 'y' 확인 등 모두 이 함수로 전송.
-    """
+    """Claude 팀리더에게 입력을 보냅니다 (비차단)."""
     if not is_session_alive() or not is_leader_ready():
         raise RuntimeError("ai-team 세션이 없습니다. ./scripts/start.sh로 시작해주세요.")
 
@@ -130,71 +153,90 @@ def send_input(message: str):
 
 class OutputMonitor:
     """
-    리더 pane 출력을 실시간 모니터링합니다.
+    capture-pane 기반 출력 모니터.
 
-    출력이 감지되면 버퍼에 쌓아두고,
-    FLUSH_TIMEOUT 동안 새 출력이 없으면 (idle)
-    버퍼를 정리하여 on_output 콜백으로 전달합니다.
-
-    → 슬랙에 실시간으로 Claude 출력이 전달됩니다.
+    주기적으로 tmux 화면을 캡처하고, 이전 캡처와 비교하여
+    새로운 Claude 응답이 감지되면 on_output 콜백으로 전달합니다.
+    화면이 FLUSH_TIMEOUT 동안 변하지 않으면 응답 완료로 간주합니다.
     """
 
     def __init__(self, on_output: Callable[[str], None]):
         self.on_output = on_output
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._log_offset = 0
+        self._last_screen = ""
+        self._last_responses: list[str] = []
 
     def start(self):
-        """모니터링 시작"""
         if self._running:
             return
-        self._log_offset = _get_log_size()
+        # 현재 화면 스냅샷을 기준점으로 잡음
+        self._last_screen = _capture_pane()
+        self._last_responses = _extract_responses(self._last_screen)
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        logger.info("OutputMonitor 시작됨")
+        logger.info("OutputMonitor 시작됨 (capture-pane 모드)")
 
     def stop(self):
-        """모니터링 중지"""
         self._running = False
         logger.info("OutputMonitor 중지됨")
 
     def reset_offset(self):
-        """새 메시지 전송 후 오프셋 리셋 (입력 에코 건너뛰기)"""
-        time.sleep(0.5)
-        self._log_offset = _get_log_size()
+        """새 메시지 전송 후 기준점 리셋."""
+        time.sleep(1)
+        self._last_screen = _capture_pane()
+        self._last_responses = _extract_responses(self._last_screen)
 
     def _loop(self):
-        buffer = ""
-        idle_start = None
+        stable_screen = ""
+        stable_since = None
 
         while self._running:
             time.sleep(POLL_INTERVAL)
 
-            current_size = _get_log_size()
+            current_screen = _capture_pane()
+            if not current_screen:
+                continue
 
-            if current_size > self._log_offset:
-                # 새 출력 있음
-                new_content = _read_log_from(self._log_offset)
-                self._log_offset = current_size
-                buffer += new_content
-                idle_start = None
+            if current_screen == self._last_screen:
+                # 화면 변화 없음
+                if stable_screen and stable_since:
+                    if time.time() - stable_since >= FLUSH_TIMEOUT:
+                        # 안정됨 → 새 응답 확인
+                        self._check_new_responses(stable_screen)
+                        stable_screen = ""
+                        stable_since = None
+                continue
 
-            elif buffer:
-                # 출력 멈춤 + 버퍼에 데이터 있음
-                if idle_start is None:
-                    idle_start = time.time()
-                elif time.time() - idle_start >= FLUSH_TIMEOUT:
-                    # idle 시간 초과 → 버퍼 플러시
-                    cleaned = _clean_output(buffer)
-                    if cleaned:
-                        try:
-                            self.on_output(cleaned)
-                        except Exception as e:
-                            logger.error(f"on_output 콜백 오류: {e}")
-                    buffer = ""
-                    idle_start = None
+            # 화면 변화 감지 → 안정 타이머 리셋
+            self._last_screen = current_screen
+            stable_screen = current_screen
+            stable_since = time.time()
+
+    def _check_new_responses(self, screen: str):
+        """새 화면에서 이전에 없던 응답을 찾아 전송한다."""
+        current_responses = _extract_responses(screen)
+
+        # 이전에 이미 전송한 응답과 비교
+        new_responses = []
+        for resp in current_responses:
+            if resp not in self._last_responses:
+                new_responses.append(resp)
+
+        if new_responses:
+            combined = '\n\n'.join(new_responses).strip()
+            if combined:
+                # 슬랙 메시지 길이 제한
+                if len(combined) > 3800:
+                    combined = combined[:1800] + "\n\n... (중략) ...\n\n" + combined[-1800:]
+                try:
+                    self.on_output(combined)
+                    logger.info(f"응답 전송됨 ({len(combined)} chars)")
+                except Exception as e:
+                    logger.error(f"on_output 콜백 오류: {e}")
+
+        self._last_responses = current_responses
 
 
 def get_team_status() -> str:
