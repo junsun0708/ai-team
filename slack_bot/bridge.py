@@ -98,7 +98,7 @@ _NOISE_PATTERNS = re.compile('|'.join([
     r'^\$\s',
     r'^\s*⧉\s+Selected',
     r'^\[Slack 요청',                      # 입력 에코
-    r'(Marinating|Manifesting|Osmosing|Thinking|Warming|Nebulizing|Crystallizing|Synthesizing|Percolating|Transmuting|Alchemizing|Conjuring|Distilling)',
+    r'[A-Z][a-z-]*ing[…\.]*\s*$',             # 모든 스피너 단어 (Xxx-ing…): Sock-hopping, Shenaniganing, Marinating 등
     r'^[✢✶✻✽✲✱✴✵●\*·•]+\s*(Searching|Reading|Writing|Editing|Running|Loading|Connecting|Fetching|Checking|Processing)',  # 스피너 + 도구 상태
     r'^\s*\d+\s*[│┃|]',                   # 코드 라인 번호
     r'^⎿',                                # 모든 도구 UI
@@ -141,18 +141,37 @@ def _is_spinner_junk(line: str) -> bool:
     'ebu', '*ebli', '✢ulzi', '·zg' 같은 스피너 조각이 남는다.
     한글/영문 의미 있는 텍스트가 아닌 짧은 조각을 필터링한다.
     """
+    # 한글이 포함된 텍스트는 의미 있는 콘텐츠로 보존
+    if re.search(r'[\uac00-\ud7af\u3131-\u3163\u314f-\u3163]', line):
+        return False
+
     if len(line) <= 6:
         # 짧은 줄: 스피너 문자 포함 여부 또는 의미 없는 조각
         if any(c in _SPINNER_CHARS for c in line):
             return True
         if _SPINNER_JUNK_RE.match(line):
             return True
-        # 의미 있는 짧은 한글은 보존 (예: "확인", "완료")
-        if re.match(r'^[\uac00-\ud7af]{1,3}$', line):
-            return False
         # 영문 단어가 아닌 짧은 조각
         if len(line) <= 3 and not re.match(r'^[a-zA-Z]+$', line):
             return True
+
+    # 스피너 부분 렌더링 조각 감지: 하이픈이 포함된 짧은 비단어 조각
+    # 예: "S-ho", "-hpp", "Sock-h", "igan", "ning…"
+    if len(line) <= 15:
+        # 하이픈으로 시작하거나, 하이픈+짧은조각 패턴
+        if re.match(r'^-\w{0,5}$', line):
+            return True
+        # 대문자 시작 + 하이픈 + 불완전 단어 (스피너 단어 파편)
+        if re.match(r'^[A-Z][a-z]{0,3}-[a-z]{0,4}$', line):
+            return True
+        # "…"로 끝나는 단일 단어 (스피너 상태)
+        if re.match(r'^[A-Za-z-]+[…]+$', line):
+            return True
+        # 단일 영단어 조각 (소문자 3~8자, 스피너 잔해 가능)
+        if re.match(r'^[a-z]{3,8}$', line) and not re.match(r'^(the|and|for|but|not|you|are|was|has|had|can|did|get|got|let|may|say|she|his|her|how|its|our|who|all|new|now|old|see|way|use|two|any)$', line):
+            # 흔한 영단어는 보존, 나머지 짧은 소문자 조각은 의심
+            pass  # 일반 단어일 수 있으므로 여기서는 통과
+
     return False
 
 
@@ -208,6 +227,10 @@ def _extract_final_response(text: str) -> str:
 
         # 스피너 잔해 필터링
         if _is_spinner_junk(stripped):
+            continue
+
+        # 스피너 단어 단독 줄: 대문자 시작 + (하이픈 포함 가능) + ing + …
+        if re.match(r'^[A-Z][a-z-]*ing[…\.]*$', stripped):
             continue
 
         # 선행 스피너/상태 문자 제거 (●, ✶ 등)
