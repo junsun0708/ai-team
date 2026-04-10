@@ -88,9 +88,9 @@ _NOISE_PATTERNS = re.compile('|'.join([
     r'^❯\s*$',                            # 빈 프롬프트
     r'^❯\s',                              # 프롬프트 + 입력
     r'^[─━═]{3,}',                        # 구분선
-    r'bypass\s+permissions',
-    r'shift\+tab\s+to\s+cycle',
-    r'esc\s+to\s+interrupt',
+    r'bypass\s*permissions',
+    r'shift\+tab\s*to\s*cycle',
+    r'esc\s*to\s*interrupt',
     r'Claude Code (v|has)',
     r'^▐▛|^▝▜|^\s*▘▘',                   # 로고
     r'Opus \d|Claude Max|Sonnet',
@@ -98,25 +98,76 @@ _NOISE_PATTERNS = re.compile('|'.join([
     r'^\$\s',
     r'^\s*⧉\s+Selected',
     r'^\[Slack 요청',                      # 입력 에코
-    r'(Marinating|Manifesting|Osmosing|Thinking|Warming)',
-    r'^[✢✶✻✽✲✱✴✵\*·]+\s*(Marinating|Manifesting|Osmosing|Thinking|Warming)',
+    r'(Marinating|Manifesting|Osmosing|Thinking|Warming|Nebulizing|Crystallizing|Synthesizing|Percolating|Transmuting|Alchemizing|Conjuring|Distilling)',
+    r'^[✢✶✻✽✲✱✴✵●\*·•]+\s*(Searching|Reading|Writing|Editing|Running|Loading|Connecting|Fetching|Checking|Processing)',  # 스피너 + 도구 상태
     r'^\s*\d+\s*[│┃|]',                   # 코드 라인 번호
-    r'^⎿\s*(Read|Write|Edit|Bash|Glob|Grep|Agent|Task)',  # 도구 사용 라인
-    r'^⎿\s*\d+ lines',                    # 도구 결과 요약
-    r'^\s*⎿',                             # 모든 도구 UI
+    r'^⎿',                                # 모든 도구 UI
+    r'^⏵',                                # 권한 모드 표시줄
+    r'^Tip:\s',                            # UI 팁
+    r'Press Shift\+Enter',                 # UI 팁 변형
+    r'ctrl\+o to expand',                  # UI 팁
+    r'Searching for \d+ pattern',          # 검색 상태
+    r'^multi-?line message',               # 팁 끝부분
 ]), re.IGNORECASE)
+
+# ANSI/터미널 이스케이프 시퀀스를 모두 제거하는 정규식
+_ANSI_RE = re.compile(
+    r'\x1b'           # ESC
+    r'(?:'
+    r'\[[0-9;?]*[a-zA-Z]'   # CSI sequences: \e[...X (일반 + DEC private mode)
+    r'|\][^\x07\x1b]*(?:\x07|\x1b\\)'  # OSC sequences: \e]...BEL
+    r'|\([\w]'        # Character set: \e(B 등
+    r'|[=>ABCDHM78]'  # 단일 문자 시퀀스
+    r')'
+)
+
+# 스피너 잔해 감지: 짧은 줄에 스피너 문자가 포함
+_SPINNER_CHARS = set('✢✶✻✽✲✱✴✵●·•*')
+_SPINNER_JUNK_RE = re.compile(r'^[✢✶✻✽✲✱✴✵●·•\*\s]{0,3}\w{0,4}$')
 
 # 프롬프트 패턴: ❯ 가 줄 시작에 나타남
 _PROMPT_RE = re.compile(r'❯')
+
+
+def _strip_ansi(text: str) -> str:
+    """모든 ANSI/터미널 이스케이프 시퀀스를 제거한다."""
+    return _ANSI_RE.sub('', text)
+
+
+def _is_spinner_junk(line: str) -> bool:
+    """스피너 애니메이션 잔해인지 판별한다.
+
+    pipe-pane은 터미널 프레임을 그대로 캡처하므로
+    'ebu', '*ebli', '✢ulzi', '·zg' 같은 스피너 조각이 남는다.
+    한글/영문 의미 있는 텍스트가 아닌 짧은 조각을 필터링한다.
+    """
+    if len(line) <= 6:
+        # 짧은 줄: 스피너 문자 포함 여부 또는 의미 없는 조각
+        if any(c in _SPINNER_CHARS for c in line):
+            return True
+        if _SPINNER_JUNK_RE.match(line):
+            return True
+        # 의미 있는 짧은 한글은 보존 (예: "확인", "완료")
+        if re.match(r'^[\uac00-\ud7af]{1,3}$', line):
+            return False
+        # 영문 단어가 아닌 짧은 조각
+        if len(line) <= 3 and not re.match(r'^[a-zA-Z]+$', line):
+            return True
+    return False
 
 
 def _extract_final_response(text: str) -> str:
     """
     pipe-pane 출력에서 마지막 텍스트 응답을 추출한다.
 
-    전략: 텍스트를 줄 단위로 순회하며 노이즈가 아닌 의미 있는 텍스트를
-    수집한다. 마지막 프롬프트(❯) 직전까지의 텍스트 블록을 반환한다.
+    전략:
+    1. 전체 텍스트에서 ANSI 이스케이프를 먼저 제거
+    2. 줄 단위로 순회하며 노이즈/스피너 잔해를 필터링
+    3. 마지막 프롬프트(❯) 직전까지의 의미 있는 텍스트 블록을 반환
     """
+    # 1단계: ANSI 이스케이프 전체 제거
+    text = _strip_ansi(text)
+
     lines = text.split('\n')
 
     # 마지막 프롬프트 위치 찾기 (뒤에서부터)
@@ -142,7 +193,7 @@ def _extract_final_response(text: str) -> str:
 
     response_lines = lines[first_prompt_idx + 1:last_prompt_idx]
 
-    # 노이즈 필터링
+    # 2단계: 노이즈 필터링
     clean_lines = []
     for line in response_lines:
         stripped = line.strip()
@@ -150,12 +201,21 @@ def _extract_final_response(text: str) -> str:
             if clean_lines and clean_lines[-1] != '':
                 clean_lines.append('')
             continue
+
+        # 노이즈 패턴 매칭
         if _NOISE_PATTERNS.search(stripped):
             continue
-        # ANSI 이스케이프 코드 제거
-        cleaned = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', stripped)
-        cleaned = re.sub(r'\x1b\][^\x07]*\x07', '', cleaned)  # OSC sequences
+
+        # 스피너 잔해 필터링
+        if _is_spinner_junk(stripped):
+            continue
+
+        # 선행 스피너/상태 문자 제거 (●, ✶ 등)
+        cleaned = re.sub(r'^[✢✶✻✽✲✱✴✵●\*·•]+\s*', '', stripped)
+        # 제어 문자 정리
+        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', cleaned)
         cleaned = cleaned.strip()
+
         if cleaned:
             clean_lines.append(cleaned)
 
@@ -167,7 +227,6 @@ def _extract_final_response(text: str) -> str:
 
     result = '\n'.join(clean_lines).strip()
 
-    # 너무 짧은 응답은 의미 없는 노이즈일 수 있음 (하지만 전달은 함)
     return result
 
 
