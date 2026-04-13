@@ -30,6 +30,8 @@ WORK_DIR = os.environ.get("WORK_DIR", os.path.expanduser("~/a-projects"))
 POLL_INTERVAL = 3
 # 프롬프트 재등장 후 추가 대기
 SETTLE_DELAY = 5
+# 입력 후 최소 대기 시간 (에이전트 시작 시 잠깐 빈 프롬프트가 보이는 문제 방지)
+MIN_WAIT_AFTER_INPUT = 10
 # 최대 응답 대기 시간 (분)
 MAX_WAIT_MINUTES = 30
 # capture-pane 히스토리 라인 수
@@ -270,6 +272,12 @@ class OutputMonitor:
             if not captured:
                 continue
 
+            # 입력 후 최소 대기 시간 확인 (에이전트 실행 시 잠깐 빈 프롬프트가 보이는 문제 방지)
+            elapsed = time.time() - wait_start if wait_start else 0
+            if elapsed < MIN_WAIT_AFTER_INPUT:
+                prompt_seen_at = None
+                continue
+
             if self._is_prompt_ready(captured):
                 if prompt_seen_at is None:
                     prompt_seen_at = time.time()
@@ -284,12 +292,13 @@ class OutputMonitor:
                             logger.info(f"응답 전송 완료 ({len(response)} chars)")
                         except Exception as e:
                             logger.error(f"on_output 콜백 오류: {e}")
+                        with self._lock:
+                            self._waiting_for_response = False
+                        prompt_seen_at = None
                     else:
-                        logger.warning("프롬프트 감지했으나 ● 블록 없음")
-
-                    with self._lock:
-                        self._waiting_for_response = False
-                    prompt_seen_at = None
+                        # ● 블록 없음 = 아직 작업 중일 수 있음, 대기 계속
+                        logger.debug("프롬프트 감지했으나 ● 블록 없음, 대기 계속")
+                        prompt_seen_at = None
             else:
                 prompt_seen_at = None
 
