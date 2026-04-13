@@ -153,6 +153,8 @@ def handle_message(event, say, client):
         _set_active_thread(channel_id, thread_ts)
 
         try:
+            if _monitor:
+                _monitor.reset_offset()
             send_input(text)
         except Exception as e:
             say(text=f":x: 전달 실패: {e}", thread_ts=thread_ts)
