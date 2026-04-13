@@ -7,5 +7,5 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-logs/*.log
+logs/
 /tmp/

@@ -23,6 +23,10 @@
 - .env, .venv/, node_modules/, __pycache__/, *.pyc
 - .DS_Store, dist/, build/, *.egg-info/
 
+## 커밋 규칙
+
+- 커밋 메시지에 Co-Authored-By 라인을 포함하지 말 것
+
 ## 보안
 
 - API 키, 자격 증명, 시크릿이 포함된 파일은 절대 커밋하지 않습니다.
