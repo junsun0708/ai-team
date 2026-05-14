@@ -32,13 +32,16 @@
 - API 키, 자격 증명, 시크릿이 포함된 파일은 절대 커밋하지 않습니다.
 - .env 파일은 항상 .gitignore에 포함합니다.
 
-## 하네스: AI Team Leader
+## 하네스: autonomous-team에 위임
 
-**목표:** Slack 작업 요청을 분석하고 에이전트 팀을 동적 구성하여 병렬 처리
+이 프로젝트는 **Slack Bot + tmux 인프라만 담당**한다. 하네스 본체(에이전트·스킬·메타 오케)는 `~/a-projects/autonomous-team`으로 분기되었다.
 
-**트리거:** 작업 요청(Slack 메시지, 프로젝트 생성, 조사, 개발 등) 시 `team-orchestrator` 스킬을 사용하라. 단순 인사/질문은 직접 응답 가능.
+- `scripts/start.sh`의 leader는 `cd ~/a-projects/autonomous-team` 후 claude를 실행 → autonomous-team의 `.claude/`(12 agents + 26 skills + `harness` 메타 스킬)가 로드된다.
+- 슬랙봇(`slack_bot/bridge.py`)의 `WORK_DIR=~/a-projects`는 그대로 유지. 새 프로젝트는 여전히 `~/a-projects/` 하위에 생성.
+- 하네스 운영·확장 가이드는 `~/a-projects/autonomous-team/CLAUDE.md` 참조.
 
 **변경 이력:**
 | 날짜 | 변경 내용 | 대상 | 사유 |
 |------|----------|------|------|
 | 2026-04-09 | 초기 구성 | 전체 | 하네스 신규 구축 |
+| 2026-05-14 | 하네스 본체를 autonomous-team으로 위임. 이 프로젝트는 Slack/tmux 인프라만 유지 | start.sh, CLAUDE.md | 하네스엔지니어링 본격 적용본을 별도 프로젝트로 분리 |

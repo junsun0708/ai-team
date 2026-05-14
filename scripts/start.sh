@@ -33,9 +33,11 @@ tmux new-session -d -s "$SESSION" -n "bot" -x 220 -y 50
 
 # Slack Bot 시작
 # leader 윈도우 생성: Claude 팀리더
+# leader cwd는 autonomous-team — 그쪽 .claude/ 하네스(12 agents + 26 skills + harness 메타 스킬)를 로드한다.
+# ai-team 프로젝트는 슬랙봇/tmux 인프라만 담당하고, 하네스 본체는 autonomous-team에 위임.
 tmux new-window -t "$SESSION" -n "leader"
 tmux send-keys -t "$SESSION:leader" \
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 claude --dangerously-skip-permissions --teammate-mode tmux" Enter
+    "cd $HOME/a-projects/autonomous-team && CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 claude --dangerously-skip-permissions --teammate-mode tmux" Enter
 
 # Claude 시작 대기
 sleep 5
